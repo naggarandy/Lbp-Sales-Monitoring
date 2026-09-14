@@ -141,6 +141,122 @@ def load_lbp(file) -> pd.DataFrame:
     return df
 
 
+
+def load_csv_pipe(file) -> pd.DataFrame:
+    """Load pipe-separated CSV and normalize to LBP schema."""
+    # try utf-8 then latin-1
+    try:
+        df = pd.read_csv(file, sep="|", dtype=str, keep_default_na=False)
+    except UnicodeDecodeError:
+        try:
+            file.seek(0)
+        except Exception:
+            pass
+        df = pd.read_csv(file, sep="|", dtype=str, keep_default_na=False, encoding="latin-1")
+
+    df.columns = df.columns.str.strip()
+    # drop fully empty cols
+    df = df.dropna(axis=1, how="all")
+
+    col_map = {}
+    for c in df.columns:
+        cl = c.lower().replace(" ", "").replace("_", "")
+        if cl in ("nooutlet", "outletid", "kodeoutlet") or c == "No Outlet":
+            col_map[c] = "No Outlet"
+        elif cl in ("namaoutlet", "outlet") or c == "Nama Outlet":
+            col_map[c] = "Nama Outlet"
+        elif "tanggalfaktur" in cl or (cl.startswith("tanggal") and "faktur" in cl):
+            col_map[c] = "Tanggal Faktur"
+        elif cl in ("qtypcs", "qty", "quantity", "jumlah"):
+            col_map[c] = "QTYPCS"
+        elif "hargabruto" in cl or cl == "bruto":
+            col_map[c] = "Harga Bruto"
+        elif cl in ("total", "net", "netsales", "grandtotal"):
+            col_map[c] = "Total"
+        elif cl in ("disc", "discount", "diskon"):
+            col_map[c] = "DISC"
+        elif "proamount" in cl or cl == "promo":
+            col_map[c] = "PROAMOUNT"
+        elif "namaproduk" in cl or cl in ("produk", "product"):
+            col_map[c] = "Nama Produk"
+        elif "subbrandname" in cl or cl == "subbrand":
+            col_map[c] = "SUBBRANDNAME"
+        elif cl in ("pcode", "kodeproduk", "sku"):
+            col_map[c] = "Pcode"
+        elif "salesman" in cl:
+            col_map[c] = "Salesman"
+        elif "kabupaten" in cl:
+            col_map[c] = "Kabupaten"
+        elif "kecamatan" in cl:
+            col_map[c] = "Kecamatan"
+        elif "channel" in cl:
+            col_map[c] = "Channel"
+        elif cl in ("week", "minggu"):
+            col_map[c] = "WEEK"
+        elif "faktur" in cl and "tanggal" not in cl:
+            col_map[c] = "Faktur"
+        elif "transtype" in cl:
+            col_map[c] = "TRANSTYPE"
+        elif cl == "amount":
+            col_map[c] = "AMOUNT"
+        elif "grupoutlet" in cl:
+            col_map[c] = "Grup Outlet"
+        elif "tipeoutlet" in cl:
+            col_map[c] = "Tipe Outlet"
+        elif cl == "kemasan":
+            col_map[c] = "Kemasan"
+        elif cl == "periode":
+            col_map[c] = "Periode"
+        elif "salesforce" in cl:
+            col_map[c] = "Salesforce"
+        elif "salesteam" in cl:
+            col_map[c] = "Sales Team"
+        elif cl == "subbrand":
+            col_map[c] = "SUBBRAND"
+        elif "kelurahan" in cl:
+            col_map[c] = "Kelurahan"
+
+    df = df.rename(columns=col_map)
+
+    for col in ["QTYPCS", "Harga Bruto", "Total", "DISC", "PROAMOUNT", "AMOUNT"]:
+        if col in df.columns:
+            s = df[col].astype(str).str.replace(",", "", regex=False).str.replace(" ", "", regex=False)
+            df[col] = pd.to_numeric(s, errors="coerce").fillna(0)
+
+    if "Tanggal Faktur" in df.columns:
+        df["Tanggal Faktur"] = pd.to_datetime(
+            df["Tanggal Faktur"], format="%d/%m/%Y", errors="coerce"
+        )
+        if df["Tanggal Faktur"].isna().mean() > 0.5:
+            df["Tanggal Faktur"] = pd.to_datetime(df["Tanggal Faktur"], errors="coerce")
+        df["Tanggal"] = df["Tanggal Faktur"].dt.date
+        df["Hari"] = df["Tanggal Faktur"].dt.day_name()
+
+    for col in ["Nama Outlet", "Nama Produk", "SUBBRANDNAME", "Salesman",
+                "Kabupaten", "Kecamatan", "Channel", "Faktur"]:
+        if col not in df.columns:
+            df[col] = "-"
+        else:
+            df[col] = df[col].fillna("-").astype(str)
+
+    if "WEEK" not in df.columns and "Tanggal Faktur" in df.columns:
+        df["WEEK"] = df["Tanggal Faktur"].dt.isocalendar().week.astype("Int64")
+    if "Pcode" not in df.columns:
+        df["Pcode"] = df.get("Nama Produk", "-")
+    if "No Outlet" not in df.columns:
+        df["No Outlet"] = df.get("Nama Outlet", "-")
+    if "Harga Bruto" not in df.columns:
+        df["Harga Bruto"] = df.get("Total", 0)
+    if "QTYPCS" not in df.columns:
+        df["QTYPCS"] = 0
+    if "Total" not in df.columns:
+        df["Total"] = df.get("Harga Bruto", 0)
+    if "DISC" not in df.columns:
+        df["DISC"] = 0
+
+    return df
+
+
 def load_cache_file(file) -> pd.DataFrame:
     """Load previously saved cache (parquet / csv / csv.gz)."""
     import gzip
@@ -251,7 +367,7 @@ st.sidebar.caption("Data tersimpan selama tab browser terbuka")
 st.sidebar.markdown("### 📂 Sumber Data")
 source_mode = st.sidebar.radio(
     "Pilih cara load data",
-    ["Upload Excel (.xlsx)", "Load Cache (.parquet)", "Load dari URL"],
+    ["Upload Excel (.xlsx)", "Upload CSV (| )", "Load Cache (.parquet)", "Load dari URL"],
     label_visibility="collapsed",
 )
 
@@ -263,7 +379,6 @@ if source_mode == "Upload Excel (.xlsx)":
         "Pilih file Excel", type=["xlsx", "xls"], key="xlsx_up"
     )
     if uploaded is not None:
-        # only reload if different file
         file_id = f"{uploaded.name}_{uploaded.size}"
         if st.session_state.get("last_file_id") != file_id:
             with st.spinner("Memproses Excel..."):
@@ -273,6 +388,22 @@ if source_mode == "Upload Excel (.xlsx)":
                     st.session_state.last_file_id = file_id
                 except Exception as e:
                     st.sidebar.error(f"Gagal baca file: {e}")
+
+elif source_mode == "Upload CSV (| )":
+    st.sidebar.caption("CSV dengan pemisah **|** (pipe). Header di baris pertama.")
+    uploaded = st.sidebar.file_uploader(
+        "Pilih file CSV", type=["csv", "txt"], key="csv_up"
+    )
+    if uploaded is not None:
+        file_id = f"csv_{uploaded.name}_{uploaded.size}"
+        if st.session_state.get("last_file_id") != file_id:
+            with st.spinner("Memproses CSV..."):
+                try:
+                    new_df = load_csv_pipe(uploaded)
+                    new_name = uploaded.name
+                    st.session_state.last_file_id = file_id
+                except Exception as e:
+                    st.sidebar.error(f"Gagal baca CSV: {e}")
 
 elif source_mode == "Load Cache (.parquet)":
     st.sidebar.info(
