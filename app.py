@@ -8,6 +8,7 @@ import numpy as np
 from io import BytesIO
 from datetime import datetime
 import hashlib
+import re
 
 st.set_page_config(
     page_title="LBP Sales Monitor",
@@ -295,6 +296,7 @@ def _to_number(series: pd.Series) -> pd.Series:
 def load_csv_pipe(file) -> pd.DataFrame:
     """Load pipe-separated CSV and normalize to LBP schema (match Excel results)."""
     import io
+    import re
 
     # Read raw bytes once
     try:
