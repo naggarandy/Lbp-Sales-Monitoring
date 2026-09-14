@@ -142,24 +142,83 @@ def load_lbp(file) -> pd.DataFrame:
 
 
 def load_cache_file(file) -> pd.DataFrame:
-    """Load previously saved cache (parquet or csv)."""
+    """Load previously saved cache (parquet / csv / csv.gz)."""
+    import gzip
     name = getattr(file, "name", "").lower()
     if name.endswith(".parquet"):
         return pd.read_parquet(file)
+    if name.endswith(".csv.gz") or name.endswith(".gz"):
+        with gzip.open(file, "rt") as f:
+            return pd.read_csv(f)
     if name.endswith(".csv"):
         return pd.read_csv(file)
-    # try parquet first
     try:
         return pd.read_parquet(file)
     except Exception:
-        file.seek(0)
-        return pd.read_csv(file)
+        try:
+            file.seek(0)
+        except Exception:
+            pass
+        try:
+            return pd.read_csv(file)
+        except Exception:
+            try:
+                file.seek(0)
+            except Exception:
+                pass
+            with gzip.open(file, "rt") as f:
+                return pd.read_csv(f)
+
+
+def prepare_cache_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Slim + type-safe dataframe for cache export."""
+    # Keep only useful columns (much smaller than full Excel)
+    keep = [
+        "No Outlet", "Nama Outlet", "Grup Outlet", "Tipe Outlet",
+        "Tanggal Faktur", "Faktur", "TRANSTYPE", "Kode Sales",
+        "Pcode", "Nama Produk", "Kemasan", "QTYPCS",
+        "AMOUNT", "Harga Bruto", "DISC", "DISC1KH", "PROAMOUNT", "Total",
+        "Channel", "Kabupaten", "Kecamatan", "Kelurahan",
+        "WEEK", "Periode", "Salesman", "Salesforce", "Sales Team",
+        "SUBBRAND", "SUBBRANDNAME",
+    ]
+    cols = [c for c in keep if c in df.columns]
+    # always keep core cols even if name differs
+    for c in ["No Outlet", "Nama Outlet", "Nama Produk", "QTYPCS", "Harga Bruto", "Total",
+              "Salesman", "Kabupaten", "Channel", "SUBBRANDNAME", "Pcode", "DISC"]:
+        if c in df.columns and c not in cols:
+            cols.append(c)
+    out = df[cols].copy()
+
+    # Force object/mixed columns to string so parquet never fails
+    for c in out.columns:
+        if out[c].dtype == object:
+            out[c] = out[c].astype(str)
+        # categorical-like mixed int/str columns
+        elif str(out[c].dtype).startswith("Int") or out[c].dtype == "int64":
+            pass
+        else:
+            try:
+                # if mostly numeric but has str leftovers, stringify
+                if out[c].map(lambda x: isinstance(x, str)).any():
+                    out[c] = out[c].astype(str)
+            except Exception:
+                out[c] = out[c].astype(str)
+    return out
 
 
 def df_to_parquet_bytes(df: pd.DataFrame) -> bytes:
     buf = BytesIO()
-    df.to_parquet(buf, index=False)
+    clean = prepare_cache_df(df)
+    clean.to_parquet(buf, index=False, compression="zstd")
     return buf.getvalue()
+
+
+def df_to_csv_gz_bytes(df: pd.DataFrame) -> bytes:
+    import gzip
+    clean = prepare_cache_df(df)
+    raw = clean.to_csv(index=False).encode("utf-8")
+    return gzip.compress(raw)
 
 
 def kpi_row(df):
@@ -221,7 +280,7 @@ elif source_mode == "Load Cache (.parquet)":
         "Lebih cepat & kecil dibanding Excel."
     )
     cache_file = st.sidebar.file_uploader(
-        "Pilih file cache", type=["parquet", "csv"], key="cache_up"
+        "Pilih file cache", type=["parquet", "csv", "gz"], key="cache_up"
     )
     if cache_file is not None:
         file_id = f"cache_{cache_file.name}_{cache_file.size}"
@@ -674,24 +733,38 @@ with tabs[6]:
     try:
         parquet_bytes = df_to_parquet_bytes(df)
         st.download_button(
-            "⬇️ Download Cache Parquet (untuk load cepat)",
+            "⬇️ Download Cache Parquet (rekomendasi)",
             data=parquet_bytes,
             file_name=f"LBP_cache_{datetime.now().strftime('%Y%m%d')}.parquet",
             mime="application/octet-stream",
             use_container_width=True,
         )
-        st.caption(f"Ukuran cache: {len(parquet_bytes)/1024:.0f} KB | {len(df):,} baris")
-    except Exception as e:
-        st.warning(f"Parquet tidak tersedia ({e}). Install pyarrow: pip install pyarrow")
-        csv_buf = BytesIO()
-        df.to_csv(csv_buf, index=False)
-        st.download_button(
-            "⬇️ Download Cache CSV",
-            data=csv_buf.getvalue(),
-            file_name=f"LBP_cache_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-            use_container_width=True,
+        st.caption(
+            f"Ukuran cache: **{len(parquet_bytes)/1024:.0f} KB** | {len(df):,} baris "
+            f"(hanya kolom penting, terkompresi)"
         )
+    except Exception as e:
+        st.warning(f"Parquet gagal ({e}). Memakai CSV.GZ sebagai alternatif.")
+        try:
+            gz = df_to_csv_gz_bytes(df)
+            st.download_button(
+                "⬇️ Download Cache CSV.GZ",
+                data=gz,
+                file_name=f"LBP_cache_{datetime.now().strftime('%Y%m%d')}.csv.gz",
+                mime="application/gzip",
+                use_container_width=True,
+            )
+            st.caption(f"Ukuran: {len(gz)/1024:.0f} KB")
+        except Exception as e2:
+            csv_buf = BytesIO()
+            prepare_cache_df(df).to_csv(csv_buf, index=False)
+            st.download_button(
+                "⬇️ Download Cache CSV",
+                data=csv_buf.getvalue(),
+                file_name=f"LBP_cache_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
     st.markdown("---")
     st.markdown("### 📊 Export Ringkasan Excel")
