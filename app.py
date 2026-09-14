@@ -293,20 +293,15 @@ def _to_number(series: pd.Series) -> pd.Series:
     return pd.to_numeric(out, errors="coerce").fillna(0.0)
 
 
+
 def load_csv_pipe(file) -> pd.DataFrame:
-    """Load pipe-separated CSV and normalize to LBP schema (match Excel results)."""
+    """Load LBP pipe-CSV so totals match Excel upload."""
     import io
-    import re
 
-    # Read raw bytes once
-    try:
-        raw = file.read()
-        if isinstance(raw, str):
-            raw = raw.encode("utf-8", errors="replace")
-    except Exception:
-        raw = file.getvalue() if hasattr(file, "getvalue") else b""
+    raw = file.read()
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", errors="replace")
 
-    # Decode
     text = None
     for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
         try:
@@ -317,144 +312,185 @@ def load_csv_pipe(file) -> pd.DataFrame:
     if text is None:
         text = raw.decode("utf-8", errors="replace")
 
-    # Peek first non-empty lines to detect separator & header row
-    lines = [ln for ln in text.splitlines() if ln.strip()]
+    # Normalize newlines
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    # drop trailing empty
+    while lines and not lines[-1].strip():
+        lines.pop()
     if not lines:
         raise ValueError("File CSV kosong")
 
-    sample = lines[:5]
-    # Count separators
-    pipe_n = sum(ln.count("|") for ln in sample)
-    semi_n = sum(ln.count(";") for ln in sample)
-    comma_n = sum(ln.count(",") for ln in sample)
-    tab_n = sum(ln.count("\t") for ln in sample)
+    # Detect separator from first non-empty line with many fields
+    non_empty = [ln for ln in lines if ln.strip()]
     sep = "|"
-    best = pipe_n
-    if semi_n > best:
-        sep, best = ";", semi_n
-    if tab_n > best:
-        sep, best = "\t", tab_n
-    # only use comma if clearly more and looks like csv header
-    if comma_n > best * 1.5 and pipe_n == 0:
-        sep = ","
+    probe = non_empty[0]
+    for candidate in ("|", ";", "\t", ","):
+        if probe.count(candidate) > probe.count(sep):
+            sep = candidate
 
-    # Detect if first line is title (like "LBP") without separators
-    header_row = 0
-    if sample[0].count(sep) < 2 and len(sample) > 1 and sample[1].count(sep) >= 2:
-        header_row = 1  # skip title row — same as Excel header=1
+    # Header row: if first line has few separators and second has many, skip first (Excel-style title)
+    header_line_idx = 0
+    if len(non_empty) > 1:
+        if non_empty[0].count(sep) < 3 and non_empty[1].count(sep) >= 3:
+            header_line_idx = 1
 
+    # Rebuild text from chosen header onwards (keep all data lines)
+    # Find actual index in full lines list
+    seen = 0
+    start_idx = 0
+    for i, ln in enumerate(lines):
+        if ln.strip():
+            if seen == header_line_idx:
+                start_idx = i
+                break
+            seen += 1
+
+    body = "\n".join(lines[start_idx:])
     df = pd.read_csv(
-        io.StringIO(text),
+        io.StringIO(body),
         sep=sep,
-        header=header_row,
+        header=0,
         dtype=str,
         keep_default_na=False,
         engine="python",
-        on_bad_lines="skip",
+        quoting=3,  # QUOTE_NONE — LBP export usually unquoted
+        on_bad_lines="warn",
     )
-    df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
-    # drop unnamed empty columns
-    df = df.loc[:, [c for c in df.columns if c and not c.lower().startswith("unnamed")]]
 
-    # Normalize column names for matching
+    # Clean column names
+    df.columns = [str(c).strip().replace("\ufeff", "").replace('"', "") for c in df.columns]
+    df = df.loc[:, [c for c in df.columns if c and not str(c).lower().startswith("unnamed")]]
+
+    # Strip cells
+    for c in df.columns:
+        df[c] = df[c].astype(str).str.strip()
+
     def norm(c):
         return re.sub(r"[^a-z0-9]", "", str(c).lower())
 
-    col_map = {}
-    used_targets = set()
+    # Exact LBP headers first (from your file)
+    exact = {
+        "nooutlet": "No Outlet",
+        "namaoutlet": "Nama Outlet",
+        "grupoutlet": "Grup Outlet",
+        "tipeoutlet": "Tipe Outlet",
+        "kg": "KG",
+        "tanggalfaktur": "Tanggal Faktur",
+        "faktur": "Faktur",
+        "transtype": "TRANSTYPE",
+        "kodesales": "Kode Sales",
+        "pcode": "Pcode",
+        "namaproduk": "Nama Produk",
+        "kemasan": "Kemasan",
+        "qtypcs": "QTYPCS",
+        "amount": "AMOUNT",
+        "hargabruto": "Harga Bruto",
+        "disc": "DISC",
+        "disc1kh": "DISC1KH",
+        "proamount": "PROAMOUNT",
+        "total": "Total",
+        "xqty pcs": "XQTYPCS",
+        "xqtypcs": "XQTYPCS",
+        "channel": "Channel",
+        "alamat": "Alamat",
+        "kabupaten": "Kabupaten",
+        "kecamatan": "Kecamatan",
+        "kelurahan": "Kelurahan",
+        "divisi": "Divisi",
+        "week": "WEEK",
+        "periode": "Periode",
+        "kodepasar": "Kode Pasar",
+        "salesman": "Salesman",
+        "salesforce": "Salesforce",
+        "salesteam": "Sales Team",
+        "callcycle": "CALLCYCLE",
+        "harikunjungan": "Hari Kunjungan",
+        "kreditlimit": "Kredit Limit",
+        "subbrand": "SUBBRAND",
+        "subbrandname": "SUBBRANDNAME",
+    }
 
-    # Priority exact / strong matches first
-    rules = [
-        (("nooutlet", "outletid", "kodeoutlet", "kdoutlet"), "No Outlet"),
-        (("namaoutlet", "outletname", "namatoko"), "Nama Outlet"),
-        (("tanggalfaktur", "tglfaktur", "tanggal"), "Tanggal Faktur"),
-        (("qtypcs", "qty", "quantity", "jumlahpcs", "jumlah"), "QTYPCS"),
-        (("hargabruto", "brutoharga", "bruto", "gross"), "Harga Bruto"),
-        (("total", "netsales", "net", "grandtotal", "nilaiafter", "nilaiakhir"), "Total"),
-        (("amount", "nilai", "nilaiamount"), "AMOUNT"),
-        (("disc", "discount", "diskon"), "DISC"),
-        (("proamount", "promo", "promovalue"), "PROAMOUNT"),
-        (("namaproduk", "produk", "product", "namabarang"), "Nama Produk"),
-        (("subbrandname", "subbrandnama"), "SUBBRANDNAME"),
-        (("pcode", "kodeproduk", "sku", "kodebarang"), "Pcode"),
+    col_map = {}
+    used = set()
+    for c in df.columns:
+        n = norm(c)
+        if n in exact and exact[n] not in used:
+            col_map[c] = exact[n]
+            used.add(exact[n])
+
+    # Fuzzy fallback for remaining
+    fuzzy = [
+        (("qtypcs", "qty"), "QTYPCS"),
+        (("hargabruto", "bruto"), "Harga Bruto"),
+        (("proamount", "promo"), "PROAMOUNT"),
+        (("namaproduk", "produk"), "Nama Produk"),
+        (("subbrandname",), "SUBBRANDNAME"),
+        (("namaoutlet",), "Nama Outlet"),
+        (("nooutlet",), "No Outlet"),
+        (("tanggalfaktur",), "Tanggal Faktur"),
+        (("kodesales",), "Kode Sales"),
         (("salesman",), "Salesman"),
         (("salesforce",), "Salesforce"),
         (("salesteam",), "Sales Team"),
-        (("kabupaten", "kota", "city"), "Kabupaten"),
+        (("kabupaten",), "Kabupaten"),
         (("kecamatan",), "Kecamatan"),
-        (("kelurahan",), "Kelurahan"),
-        (("channel", "kanal"), "Channel"),
-        (("week", "minggu"), "WEEK"),
-        (("faktur", "nofaktur", "invoice", "nomorfaktur"), "Faktur"),
-        (("transtype", "tipe", "jenistransaksi"), "TRANSTYPE"),
-        (("grupoutlet", "groupoutlet"), "Grup Outlet"),
-        (("tipeoutlet", "outletype", "outlettype"), "Tipe Outlet"),
-        (("kemasan", "packaging"), "Kemasan"),
-        (("periode", "period"), "Periode"),
-        (("subbrand",), "SUBBRAND"),
-        (("kodesales", "salescode"), "Kode Sales"),
+        (("channel",), "Channel"),
+        (("pcode", "sku"), "Pcode"),
+        (("faktur",), "Faktur"),
+        (("amount",), "AMOUNT"),
+        (("total", "netsales"), "Total"),
+        (("disc", "diskon"), "DISC"),
     ]
-
-    norms = {c: norm(c) for c in df.columns}
-
-    # 1) exact norm match
-    for c, n in norms.items():
-        for keys, target in rules:
-            if n in keys and target not in used_targets:
-                col_map[c] = target
-                used_targets.add(target)
-                break
-
-    # 2) substring match for remaining
-    for c, n in norms.items():
+    for c in df.columns:
         if c in col_map:
             continue
-        for keys, target in rules:
-            if target in used_targets:
+        n = norm(c)
+        for keys, target in fuzzy:
+            if target in used:
                 continue
-            if any(k in n for k in keys):
-                # avoid salesman matching salesforce
+            if n in keys or any(k == n for k in keys):
                 if target == "Salesman" and ("force" in n or "team" in n):
                     continue
                 if target == "Faktur" and "tanggal" in n:
                     continue
-                if target == "Tanggal Faktur" and n == "faktur":
-                    continue
                 col_map[c] = target
-                used_targets.add(target)
+                used.add(target)
                 break
 
     df = df.rename(columns=col_map)
     df = _dedupe_columns(df)
 
-    # Numeric columns — critical for matching Excel
-    for col in ["QTYPCS", "Harga Bruto", "Total", "DISC", "PROAMOUNT", "AMOUNT"]:
+    # --- Numbers (critical) ---
+    for col in ["QTYPCS", "Harga Bruto", "Total", "DISC", "PROAMOUNT", "AMOUNT", "DISC1KH"]:
         if col in df.columns:
             df[col] = _to_number(_ensure_series(df, col))
 
-    # If Total missing but AMOUNT exists, use AMOUNT as fallback bruto/total
+    # Fallbacks aligned with Excel semantics
     if "Harga Bruto" not in df.columns and "AMOUNT" in df.columns:
         df["Harga Bruto"] = df["AMOUNT"]
+    if "AMOUNT" not in df.columns and "Harga Bruto" in df.columns:
+        df["AMOUNT"] = df["Harga Bruto"]
     if "Total" not in df.columns:
-        if "Harga Bruto" in df.columns:
-            disc = df["DISC"] if "DISC" in df.columns else 0
-            promo = df["PROAMOUNT"] if "PROAMOUNT" in df.columns else 0
-            # Excel Total ≈ bruto - disc - promo (approx); if not available keep bruto
-            df["Total"] = pd.to_numeric(df["Harga Bruto"], errors="coerce").fillna(0) \
-                - pd.to_numeric(disc, errors="coerce").fillna(0) \
-                - pd.to_numeric(promo, errors="coerce").fillna(0)
-        elif "AMOUNT" in df.columns:
-            df["Total"] = df["AMOUNT"]
-        else:
-            df["Total"] = 0
-    if "Harga Bruto" not in df.columns:
-        df["Harga Bruto"] = df.get("Total", 0)
-    if "QTYPCS" not in df.columns:
-        df["QTYPCS"] = 0
-    if "DISC" not in df.columns:
-        df["DISC"] = 0
+        bruto = df["Harga Bruto"] if "Harga Bruto" in df.columns else 0
+        disc = df["DISC"] if "DISC" in df.columns else 0
+        promo = df["PROAMOUNT"] if "PROAMOUNT" in df.columns else 0
+        df["Total"] = (
+            pd.to_numeric(bruto, errors="coerce").fillna(0)
+            - pd.to_numeric(disc, errors="coerce").fillna(0)
+            - pd.to_numeric(promo, errors="coerce").fillna(0)
+        )
+    for col, default in [("Harga Bruto", 0), ("QTYPCS", 0), ("DISC", 0), ("PROAMOUNT", 0)]:
+        if col not in df.columns:
+            df[col] = default
 
-    # Dates
+    # No Outlet: keep as string, strip leading zeros for consistency with Excel display
+    if "No Outlet" in df.columns:
+        s = _ensure_series(df, "No Outlet").astype(str).str.strip()
+        # only strip leading zeros if pure digits
+        df["No Outlet"] = s.map(lambda x: str(int(x)) if x.isdigit() else x)
+
+    # Dates dd/mm/yyyy
     if "Tanggal Faktur" in df.columns:
         s = _ensure_series(df, "Tanggal Faktur")
         dt = pd.to_datetime(s, format="%d/%m/%Y", errors="coerce")
@@ -465,25 +501,25 @@ def load_csv_pipe(file) -> pd.DataFrame:
         df["Hari"] = df["Tanggal Faktur"].dt.day_name()
 
     for col in ["Nama Outlet", "Nama Produk", "SUBBRANDNAME", "Salesman",
-                "Kabupaten", "Kecamatan", "Channel", "Faktur", "Pcode", "No Outlet"]:
+                "Kabupaten", "Kecamatan", "Channel", "Faktur", "Pcode"]:
         if col not in df.columns:
             df[col] = "-"
         else:
             df[col] = _ensure_series(df, col).fillna("-").astype(str).str.strip()
             df[col] = df[col].replace({"": "-", "nan": "-"})
 
+    if "No Outlet" not in df.columns:
+        df["No Outlet"] = df.get("Nama Outlet", "-")
     if "WEEK" not in df.columns and "Tanggal Faktur" in df.columns:
         df["WEEK"] = df["Tanggal Faktur"].dt.isocalendar().week.astype("Int64")
     if "SUBBRANDNAME" not in df.columns:
         df["SUBBRANDNAME"] = "-"
 
     df = _fix_salesman_salesforce(df)
-
-    # Store detection info for UI diagnostics
     df.attrs["csv_sep"] = sep
-    df.attrs["csv_header_row"] = header_row
+    df.attrs["csv_header_row"] = header_line_idx
     df.attrs["csv_mapped"] = dict(col_map)
-
+    df.attrs["csv_rows"] = len(df)
     return df
 
 
