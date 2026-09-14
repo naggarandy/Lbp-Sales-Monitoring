@@ -35,6 +35,66 @@ st.markdown("""
 
 
 
+
+def _fix_salesman_salesforce(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure Salesman holds person/route names, not team codes."""
+    has_sm = "Salesman" in df.columns
+    has_sf = "Salesforce" in df.columns
+    if not has_sm and not has_sf:
+        return df
+
+    def _sample_text(col, n=30):
+        s = _ensure_series(df, col).astype(str).str.strip()
+        s = s[s.notna() & (s != "") & (s != "-") & (s != "nan")]
+        return s.head(n).tolist()
+
+    def _looks_like_team(vals):
+        # Salesforce / team style: "127-TOBIG-...", "999-SO - SALES OFFICE", "121-TR - TO RETAIL"
+        keys = ("TOBIG", "SALES OFFICE", "TO RETAIL", "TO ALL", "GROMIN",
+                "KVS", "KV ", "-SO ", "-TR ", "-TA ", "-TG ", "OUTLET &")
+        if not vals:
+            return 0
+        hit = sum(1 for v in vals if any(k in v.upper() for k in keys))
+        return hit / max(len(vals), 1)
+
+    def _looks_like_person(vals):
+        # Salesman style: "M3-TG01 RANDY", "M3-TR02 DANI", contains letters after code
+        if not vals:
+            return 0
+        hit = 0
+        for v in vals:
+            u = v.upper()
+            # has a space + alphabetic name part, or pattern M3- / letters
+            if " " in v and any(ch.isalpha() for ch in v.split(" ")[-1]):
+                hit += 1
+            elif u.startswith("M3-") or u.startswith("M3 "):
+                hit += 1
+        return hit / max(len(vals), 1)
+
+    if has_sm and has_sf:
+        sm_vals = _sample_text("Salesman")
+        sf_vals = _sample_text("Salesforce")
+        sm_team = _looks_like_team(sm_vals)
+        sf_team = _looks_like_team(sf_vals)
+        sm_person = _looks_like_person(sm_vals)
+        sf_person = _looks_like_person(sf_vals)
+        # Swap if Salesman looks more like team AND Salesforce looks more like person
+        if sm_team > sf_team and sf_person >= sm_person and sm_team >= 0.3:
+            df = df.rename(columns={"Salesman": "Salesforce", "Salesforce": "Salesman"})
+            # after rename both names exist still; values swapped via rename of cols - correct
+    elif has_sf and not has_sm:
+        # only Salesforce present - if it looks like person names, treat as Salesman
+        sf_vals = _sample_text("Salesforce")
+        if _looks_like_person(sf_vals) > _looks_like_team(sf_vals):
+            df = df.rename(columns={"Salesforce": "Salesman"})
+    elif has_sm and not has_sf:
+        sm_vals = _sample_text("Salesman")
+        if _looks_like_team(sm_vals) > _looks_like_person(sm_vals) and _looks_like_team(sm_vals) >= 0.3:
+            # mislabeled: it's actually salesforce-style, but keep as Salesman for UI
+            pass
+    return df
+
+
 def col_uniques(df, col):
     """Safe unique values even if duplicate column names exist."""
     if col not in df.columns:
@@ -108,8 +168,18 @@ def load_lbp(file) -> pd.DataFrame:
             col_map[c] = "SUBBRANDNAME"
         elif c in ("Pcode", "PCODE", "pcode"):
             col_map[c] = "Pcode"
-        elif "salesman" in cl:
+        elif cl == "salesman" or c.strip() == "Salesman":
             col_map[c] = "Salesman"
+        elif cl == "salesforce" or c.strip() == "Salesforce":
+            col_map[c] = "Salesforce"
+        elif cl == "salesteam" or c.strip() == "Sales Team":
+            col_map[c] = "Sales Team"
+        elif "salesman" in cl and "force" not in cl and "team" not in cl:
+            col_map[c] = "Salesman"
+        elif "salesforce" in cl:
+            col_map[c] = "Salesforce"
+        elif "salesteam" in cl or ("sales" in cl and "team" in cl):
+            col_map[c] = "Sales Team"
         elif "kabupaten" in cl:
             col_map[c] = "Kabupaten"
         elif "kecamatan" in cl:
@@ -164,6 +234,7 @@ def load_lbp(file) -> pd.DataFrame:
     if "DISC" not in df.columns:
         df["DISC"] = 0
 
+    df = _fix_salesman_salesforce(df)
     return df
 
 
@@ -209,8 +280,18 @@ def load_csv_pipe(file) -> pd.DataFrame:
             col_map[c] = "SUBBRANDNAME"
         elif cl in ("pcode", "kodeproduk", "sku"):
             col_map[c] = "Pcode"
-        elif "salesman" in cl:
+        elif cl == "salesman" or c.strip() == "Salesman":
             col_map[c] = "Salesman"
+        elif cl == "salesforce" or c.strip() == "Salesforce":
+            col_map[c] = "Salesforce"
+        elif cl == "salesteam" or c.strip() in ("Sales Team", "Salesteam"):
+            col_map[c] = "Sales Team"
+        elif "salesman" in cl and "force" not in cl and "team" not in cl:
+            col_map[c] = "Salesman"
+        elif "salesforce" in cl:
+            col_map[c] = "Salesforce"
+        elif "salesteam" in cl or ("sales" in cl and "team" in cl):
+            col_map[c] = "Sales Team"
         elif "kabupaten" in cl:
             col_map[c] = "Kabupaten"
         elif "kecamatan" in cl:
@@ -233,10 +314,6 @@ def load_csv_pipe(file) -> pd.DataFrame:
             col_map[c] = "Kemasan"
         elif cl == "periode":
             col_map[c] = "Periode"
-        elif "salesforce" in cl:
-            col_map[c] = "Salesforce"
-        elif "salesteam" in cl:
-            col_map[c] = "Sales Team"
         elif cl == "subbrand":
             col_map[c] = "SUBBRAND"
         elif "kelurahan" in cl:
@@ -281,6 +358,7 @@ def load_csv_pipe(file) -> pd.DataFrame:
     if "DISC" not in df.columns:
         df["DISC"] = 0
 
+    df = _fix_salesman_salesforce(df)
     return df
 
 
@@ -289,28 +367,30 @@ def load_cache_file(file) -> pd.DataFrame:
     import gzip
     name = getattr(file, "name", "").lower()
     if name.endswith(".parquet"):
-        return pd.read_parquet(file)
-    if name.endswith(".csv.gz") or name.endswith(".gz"):
+        df = pd.read_parquet(file)
+    elif name.endswith(".csv.gz") or name.endswith(".gz"):
         with gzip.open(file, "rt") as f:
-            return pd.read_csv(f)
-    if name.endswith(".csv"):
-        return pd.read_csv(file)
-    try:
-        return pd.read_parquet(file)
-    except Exception:
+            df = pd.read_csv(f)
+    elif name.endswith(".csv"):
+        df = pd.read_csv(file)
+    else:
         try:
-            file.seek(0)
-        except Exception:
-            pass
-        try:
-            return pd.read_csv(file)
+            df = pd.read_parquet(file)
         except Exception:
             try:
                 file.seek(0)
             except Exception:
                 pass
-            with gzip.open(file, "rt") as f:
-                return pd.read_csv(f)
+            try:
+                df = pd.read_csv(file)
+            except Exception:
+                try:
+                    file.seek(0)
+                except Exception:
+                    pass
+                with gzip.open(file, "rt") as f:
+                    df = pd.read_csv(f)
+    return _fix_salesman_salesforce(df)
 
 
 def prepare_cache_df(df: pd.DataFrame) -> pd.DataFrame:
