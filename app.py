@@ -1,12 +1,13 @@
 """
 LBP Sales Monitor - Mobile-friendly Streamlit App
-Upload XLSX sales file → get full monitoring dashboard
+Upload XLSX once → data tersimpan di session + bisa disimpan sebagai cache
 """
 import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
 from datetime import datetime
+import hashlib
 
 st.set_page_config(
     page_title="LBP Sales Monitor",
@@ -15,15 +16,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS for mobile ──
 st.markdown("""
 <style>
     .block-container { padding-top: 1rem; padding-bottom: 1rem; }
     div[data-testid="stMetric"] {
-        background: #f0f7ff;
-        border: 1px solid #d0e3f5;
-        border-radius: 10px;
-        padding: 10px 14px;
+        background: #f0f7ff; border: 1px solid #d0e3f5;
+        border-radius: 10px; padding: 10px 14px;
     }
     div[data-testid="stMetric"] label { font-size: 0.8rem !important; }
     div[data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 1.2rem !important; }
@@ -36,7 +34,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Helpers ──
 def fmt_rp(v):
     if pd.isna(v):
         return "-"
@@ -47,19 +44,20 @@ def fmt_num(v):
         return "-"
     return f"{v:,.0f}"
 
+
 def load_lbp(file) -> pd.DataFrame:
     """Load and clean LBP-style Excel."""
-    # Try header=1 first (LBP format has title row)
     df = pd.read_excel(file, header=1)
     df.columns = df.columns.str.strip()
 
-    # If columns look wrong, try header=0
     if "No Outlet" not in df.columns and "Nama Outlet" not in df.columns:
-        file.seek(0)
+        try:
+            file.seek(0)
+        except Exception:
+            pass
         df = pd.read_excel(file, header=0)
         df.columns = df.columns.str.strip()
 
-    # Standardize expected columns
     col_map = {}
     for c in df.columns:
         cl = c.lower().replace(" ", "")
@@ -67,7 +65,7 @@ def load_lbp(file) -> pd.DataFrame:
             col_map[c] = "No Outlet"
         elif "namaoutlet" in cl or c == "Nama Outlet":
             col_map[c] = "Nama Outlet"
-        elif "tanggalfaktur" in cl or "tanggal" in cl:
+        elif "tanggalfaktur" in cl or ("tanggal" in cl and "faktur" in cl):
             col_map[c] = "Tanggal Faktur"
         elif c in ("QTYPCS", "Qty", "qty"):
             col_map[c] = "QTYPCS"
@@ -99,25 +97,24 @@ def load_lbp(file) -> pd.DataFrame:
             col_map[c] = "Faktur"
         elif "transtype" in cl:
             col_map[c] = "TRANSTYPE"
+        elif "amount" == cl:
+            col_map[c] = "AMOUNT"
 
     df = df.rename(columns=col_map)
 
-    # Numeric
     for col in ["QTYPCS", "Harga Bruto", "Total", "DISC", "PROAMOUNT", "AMOUNT"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # Date
     if "Tanggal Faktur" in df.columns:
         df["Tanggal Faktur"] = pd.to_datetime(
             df["Tanggal Faktur"], format="%d/%m/%Y", errors="coerce"
         )
-        if df["Tanggal Faktur"].isna().all():
+        if df["Tanggal Faktur"].isna().mean() > 0.5:
             df["Tanggal Faktur"] = pd.to_datetime(df["Tanggal Faktur"], errors="coerce")
         df["Tanggal"] = df["Tanggal Faktur"].dt.date
         df["Hari"] = df["Tanggal Faktur"].dt.day_name()
 
-    # Fill missing text cols
     for col in ["Nama Outlet", "Nama Produk", "SUBBRANDNAME", "Salesman",
                 "Kabupaten", "Kecamatan", "Channel", "Faktur"]:
         if col not in df.columns:
@@ -126,24 +123,43 @@ def load_lbp(file) -> pd.DataFrame:
             df[col] = df[col].fillna("-").astype(str)
 
     if "WEEK" not in df.columns and "Tanggal Faktur" in df.columns:
-        df["WEEK"] = df["Tanggal Faktur"].dt.isocalendar().week.astype(int)
+        df["WEEK"] = df["Tanggal Faktur"].dt.isocalendar().week.astype("Int64")
 
     if "Pcode" not in df.columns:
         df["Pcode"] = df.get("Nama Produk", "-")
-
     if "No Outlet" not in df.columns:
         df["No Outlet"] = df.get("Nama Outlet", "-")
-
     if "Harga Bruto" not in df.columns:
         df["Harga Bruto"] = df.get("Total", 0)
-
     if "QTYPCS" not in df.columns:
         df["QTYPCS"] = 0
-
     if "Total" not in df.columns:
         df["Total"] = df.get("Harga Bruto", 0)
+    if "DISC" not in df.columns:
+        df["DISC"] = 0
 
     return df
+
+
+def load_cache_file(file) -> pd.DataFrame:
+    """Load previously saved cache (parquet or csv)."""
+    name = getattr(file, "name", "").lower()
+    if name.endswith(".parquet"):
+        return pd.read_parquet(file)
+    if name.endswith(".csv"):
+        return pd.read_csv(file)
+    # try parquet first
+    try:
+        return pd.read_parquet(file)
+    except Exception:
+        file.seek(0)
+        return pd.read_csv(file)
+
+
+def df_to_parquet_bytes(df: pd.DataFrame) -> bytes:
+    buf = BytesIO()
+    df.to_parquet(buf, index=False)
+    return buf.getvalue()
 
 
 def kpi_row(df):
@@ -160,56 +176,144 @@ def kpi_row(df):
     c8.metric("Return", fmt_rp(ret))
 
 
-# ── Sidebar ──
+# ── Init session state ──
+if "df" not in st.session_state:
+    st.session_state.df = None
+if "source_name" not in st.session_state:
+    st.session_state.source_name = None
+if "loaded_at" not in st.session_state:
+    st.session_state.loaded_at = None
+
+
+# ── Sidebar: Data Source ──
 st.sidebar.title("📊 LBP Monitor")
-st.sidebar.caption("Upload file XLSX penjualan")
+st.sidebar.caption("Data tersimpan selama tab browser terbuka")
 
-uploaded = st.sidebar.file_uploader("Pilih file Excel", type=["xlsx", "xls", "csv"])
+st.sidebar.markdown("### 📂 Sumber Data")
+source_mode = st.sidebar.radio(
+    "Pilih cara load data",
+    ["Upload Excel (.xlsx)", "Load Cache (.parquet)", "Load dari URL"],
+    label_visibility="collapsed",
+)
 
-if uploaded is None:
+new_df = None
+new_name = None
+
+if source_mode == "Upload Excel (.xlsx)":
+    uploaded = st.sidebar.file_uploader(
+        "Pilih file Excel", type=["xlsx", "xls"], key="xlsx_up"
+    )
+    if uploaded is not None:
+        # only reload if different file
+        file_id = f"{uploaded.name}_{uploaded.size}"
+        if st.session_state.get("last_file_id") != file_id:
+            with st.spinner("Memproses Excel..."):
+                try:
+                    new_df = load_lbp(uploaded)
+                    new_name = uploaded.name
+                    st.session_state.last_file_id = file_id
+                except Exception as e:
+                    st.sidebar.error(f"Gagal baca file: {e}")
+
+elif source_mode == "Load Cache (.parquet)":
+    st.sidebar.info(
+        "Gunakan file cache yang sebelumnya di-download dari tab **Export**. "
+        "Lebih cepat & kecil dibanding Excel."
+    )
+    cache_file = st.sidebar.file_uploader(
+        "Pilih file cache", type=["parquet", "csv"], key="cache_up"
+    )
+    if cache_file is not None:
+        file_id = f"cache_{cache_file.name}_{cache_file.size}"
+        if st.session_state.get("last_file_id") != file_id:
+            with st.spinner("Memuat cache..."):
+                try:
+                    new_df = load_cache_file(cache_file)
+                    new_name = cache_file.name
+                    st.session_state.last_file_id = file_id
+                except Exception as e:
+                    st.sidebar.error(f"Gagal load cache: {e}")
+
+else:  # URL
+    st.sidebar.caption(
+        "Tempel link langsung ke file .xlsx / .parquet "
+        "(Google Drive: gunakan link download langsung)"
+    )
+    url = st.sidebar.text_input("URL file", placeholder="https://...")
+    if st.sidebar.button("Load dari URL", use_container_width=True) and url:
+        with st.spinner("Mengunduh & memproses..."):
+            try:
+                if "drive.google.com" in url and "/file/d/" in url:
+                    # convert sharing link to direct download
+                    fid = url.split("/file/d/")[1].split("/")[0]
+                    url = f"https://drive.google.com/uc?export=download&id={fid}"
+                if url.lower().endswith(".parquet"):
+                    new_df = pd.read_parquet(url)
+                else:
+                    new_df = load_lbp(url)
+                new_name = url.split("/")[-1][:40]
+                st.session_state.last_file_id = f"url_{url}"
+            except Exception as e:
+                st.sidebar.error(f"Gagal load URL: {e}")
+
+# Apply new data to session
+if new_df is not None:
+    st.session_state.df = new_df
+    st.session_state.source_name = new_name
+    st.session_state.loaded_at = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+# Clear data
+if st.session_state.df is not None:
+    st.sidebar.success(
+        f"✅ {len(st.session_state.df):,} baris\n\n"
+        f"📄 {st.session_state.source_name or '-'}\n\n"
+        f"🕒 {st.session_state.loaded_at or '-'}"
+    )
+    if st.sidebar.button("🗑️ Hapus data (load ulang)", use_container_width=True):
+        st.session_state.df = None
+        st.session_state.source_name = None
+        st.session_state.loaded_at = None
+        st.session_state.last_file_id = None
+        st.rerun()
+
+df = st.session_state.df
+
+if df is None:
     st.title("📊 LBP Sales Monitor")
     st.info(
-        "👈 Upload file Excel (format LBP) di sidebar kiri untuk mulai monitoring.\n\n"
-        "**Fitur:**\n"
-        "- KPI ringkasan (Qty, Omset Bruto, Net Sales)\n"
-        "- Monitoring per Produk, Outlet, Salesman, Wilayah\n"
-        "- Tren harian & mingguan\n"
-        "- Filter interaktif\n"
-        "- Optimasi tampilan HP"
+        "👈 Pilih sumber data di sidebar untuk mulai.\n\n"
+        "**3 cara load data:**\n"
+        "1. **Upload Excel** — file XLSX mentah (pertama kali)\n"
+        "2. **Load Cache** — file `.parquet` yang pernah di-download (jauh lebih cepat)\n"
+        "3. **Load dari URL** — link langsung ke file online\n\n"
+        "💡 **Tips agar tidak upload ulang terus:**\n"
+        "- Selama tab browser **tidak ditutup**, data tetap ada (pindah menu pun aman)\n"
+        "- Di tab **Export**, download **Cache Parquet** → lain kali load file itu (lebih kecil & cepat)\n"
+        "- Atau simpan file Excel di Google Drive → load via URL"
     )
     st.markdown("---")
     st.markdown(
-        "**Format yang didukung:** File XLSX dengan kolom seperti "
+        "**Format didukung:** XLSX dengan kolom seperti "
         "`No Outlet`, `Nama Outlet`, `Nama Produk`, `QTYPCS`, `Harga Bruto`, `Total`, "
-        "`Salesman`, `Kabupaten`, `Channel`, `Tanggal Faktur`, dll."
+        "`Salesman`, `Kabupaten`, `Channel`, `Tanggal Faktur`"
     )
     st.stop()
 
-# ── Load ──
-with st.spinner("Memproses file..."):
-    try:
-        df = load_lbp(uploaded)
-    except Exception as e:
-        st.error(f"Gagal membaca file: {e}")
-        st.stop()
 
-st.sidebar.success(f"✅ {len(df):,} baris | {df['No Outlet'].nunique():,} outlet")
-
-# ── Global filters ──
+# ── Filters ──
 st.sidebar.markdown("### 🔎 Filter")
-all_kab = sorted(df["Kabupaten"].unique().tolist())
+all_kab = sorted(df["Kabupaten"].dropna().unique().tolist())
 sel_kab = st.sidebar.multiselect("Kabupaten", all_kab, default=all_kab)
 
-all_sm = sorted(df["Salesman"].unique().tolist())
+all_sm = sorted(df["Salesman"].dropna().unique().tolist())
 sel_sm = st.sidebar.multiselect("Salesman", all_sm, default=[])
 
-all_sb = sorted(df["SUBBRANDNAME"].unique().tolist())
+all_sb = sorted(df["SUBBRANDNAME"].dropna().unique().tolist())
 sel_sb = st.sidebar.multiselect("Subbrand", all_sb, default=[])
 
-all_ch = sorted(df["Channel"].unique().tolist())
+all_ch = sorted(df["Channel"].dropna().unique().tolist())
 sel_ch = st.sidebar.multiselect("Channel", all_ch, default=[])
 
-# Apply filters
 fdf = df.copy()
 if sel_kab:
     fdf = fdf[fdf["Kabupaten"].isin(sel_kab)]
@@ -223,8 +327,10 @@ if sel_ch:
 if "Tanggal Faktur" in fdf.columns and fdf["Tanggal Faktur"].notna().any():
     min_d = fdf["Tanggal Faktur"].min().date()
     max_d = fdf["Tanggal Faktur"].max().date()
-    date_range = st.sidebar.date_input("Rentang Tanggal", [min_d, max_d], min_value=min_d, max_value=max_d)
-    if len(date_range) == 2:
+    date_range = st.sidebar.date_input(
+        "Rentang Tanggal", [min_d, max_d], min_value=min_d, max_value=max_d
+    )
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
         fdf = fdf[
             (fdf["Tanggal Faktur"].dt.date >= date_range[0])
             & (fdf["Tanggal Faktur"].dt.date <= date_range[1])
@@ -232,14 +338,18 @@ if "Tanggal Faktur" in fdf.columns and fdf["Tanggal Faktur"].notna().any():
 
 st.sidebar.markdown(f"**Data aktif:** {len(fdf):,} baris")
 
+
 # ── Main ──
 st.title("📊 LBP Sales Monitor")
 if "Tanggal Faktur" in fdf.columns and fdf["Tanggal Faktur"].notna().any():
     st.caption(
+        f"📄 {st.session_state.source_name} | "
         f"Periode: {fdf['Tanggal Faktur'].min().strftime('%d/%m/%Y')} – "
         f"{fdf['Tanggal Faktur'].max().strftime('%d/%m/%Y')} | "
-        f"Update: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        f"Loaded: {st.session_state.loaded_at}"
     )
+else:
+    st.caption(f"📄 {st.session_state.source_name} | Loaded: {st.session_state.loaded_at}")
 
 kpi_row(fdf)
 st.markdown("---")
@@ -249,11 +359,11 @@ tabs = st.tabs([
     "📍 Wilayah", "📅 Tren", "🔄 Return", "⬇️ Export"
 ])
 
-# ══════ TAB PRODUK ══════
+# ══════ PRODUK ══════
 with tabs[0]:
     st.subheader("Monitoring per Produk")
     prod = (
-        fdf.groupby(["Pcode", "Nama Produk", "SUBBRANDNAME"])
+        fdf.groupby(["Pcode", "Nama Produk", "SUBBRANDNAME"], dropna=False)
         .agg(Qty=("QTYPCS", "sum"), Bruto=("Harga Bruto", "sum"),
              Net=("Total", "sum"), Disc=("DISC", "sum"),
              Outlet=("No Outlet", "nunique"), Faktur=("Faktur", "nunique"))
@@ -265,11 +375,8 @@ with tabs[0]:
     prod["% Bruto"] = (prod["Bruto"] / total_bruto * 100).round(1)
     prod["% Qty"] = (prod["Qty"] / total_qty * 100).round(1)
 
-    # Search product
     q = st.text_input("🔍 Cari produk", "", key="prod_search")
-    show = prod.copy()
-    if q:
-        show = show[show["Nama Produk"].str.contains(q, case=False, na=False)]
+    show = prod if not q else prod[prod["Nama Produk"].str.contains(q, case=False, na=False)]
 
     st.dataframe(
         show.rename(columns={
@@ -277,8 +384,7 @@ with tabs[0]:
             "Qty": "Qty (pcs)", "Bruto": "Omset Bruto", "Net": "Net Sales",
             "Disc": "Discount", "Outlet": "Jml Outlet", "Faktur": "Jml Faktur"
         }),
-        use_container_width=True,
-        hide_index=True,
+        use_container_width=True, hide_index=True,
         column_config={
             "Omset Bruto": st.column_config.NumberColumn(format="Rp %d"),
             "Net Sales": st.column_config.NumberColumn(format="Rp %d"),
@@ -289,14 +395,14 @@ with tabs[0]:
         },
     )
 
-    st.markdown("#### Top 10 Produk — Omset Bruto")
-    top10 = prod.head(10)
-    st.bar_chart(top10.set_index("Nama Produk")["Bruto"])
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### Top 10 — Omset Bruto")
+        st.bar_chart(prod.head(10).set_index("Nama Produk")["Bruto"])
+    with c2:
+        st.markdown("#### Top 10 — Quantity")
+        st.bar_chart(prod.head(10).set_index("Nama Produk")["Qty"])
 
-    st.markdown("#### Top 10 Produk — Quantity")
-    st.bar_chart(top10.set_index("Nama Produk")["Qty"])
-
-    # Subbrand summary
     st.markdown("#### Ringkasan Subbrand")
     sb = (
         fdf.groupby("SUBBRANDNAME")
@@ -314,11 +420,11 @@ with tabs[0]:
         },
     )
 
-# ══════ TAB OUTLET ══════
+# ══════ OUTLET ══════
 with tabs[1]:
     st.subheader("Monitoring per Outlet")
     out = (
-        fdf.groupby(["No Outlet", "Nama Outlet", "Kabupaten", "Channel"])
+        fdf.groupby(["No Outlet", "Nama Outlet", "Kabupaten", "Channel"], dropna=False)
         .agg(Qty=("QTYPCS", "sum"), Bruto=("Harga Bruto", "sum"),
              Net=("Total", "sum"), Faktur=("Faktur", "nunique"),
              SKU=("Pcode", "nunique"))
@@ -327,11 +433,9 @@ with tabs[1]:
     )
 
     q2 = st.text_input("🔍 Cari outlet", "", key="out_search")
-    show2 = out.copy()
-    if q2:
-        show2 = show2[show2["Nama Outlet"].str.contains(q2, case=False, na=False)]
-
+    show2 = out if not q2 else out[out["Nama Outlet"].str.contains(q2, case=False, na=False)]
     top_n = st.slider("Tampilkan Top N outlet", 10, 100, 30, key="out_topn")
+
     st.dataframe(
         show2.head(top_n).rename(columns={
             "Nama Outlet": "Outlet", "Qty": "Qty (pcs)",
@@ -349,13 +453,8 @@ with tabs[1]:
     st.markdown("#### Top 15 Outlet — Omset Bruto")
     st.bar_chart(out.head(15).set_index("Nama Outlet")["Bruto"])
 
-    # Product x Outlet detail
     st.markdown("#### Detail Produk di Outlet")
-    sel_out = st.selectbox(
-        "Pilih outlet",
-        options=out["Nama Outlet"].head(50).tolist(),
-        key="sel_outlet",
-    )
+    sel_out = st.selectbox("Pilih outlet", out["Nama Outlet"].head(50).tolist(), key="sel_outlet")
     if sel_out:
         od = fdf[fdf["Nama Outlet"] == sel_out]
         od_prod = (
@@ -364,8 +463,10 @@ with tabs[1]:
             .reset_index().sort_values("Bruto", ascending=False)
         )
         st.dataframe(
-            od_prod.rename(columns={"Nama Produk": "Produk", "SUBBRANDNAME": "Subbrand",
-                                    "Qty": "Qty (pcs)", "Bruto": "Omset Bruto", "Net": "Net Sales"}),
+            od_prod.rename(columns={
+                "Nama Produk": "Produk", "SUBBRANDNAME": "Subbrand",
+                "Qty": "Qty (pcs)", "Bruto": "Omset Bruto", "Net": "Net Sales"
+            }),
             use_container_width=True, hide_index=True,
             column_config={
                 "Omset Bruto": st.column_config.NumberColumn(format="Rp %d"),
@@ -374,7 +475,7 @@ with tabs[1]:
             },
         )
 
-# ══════ TAB SALESMAN ══════
+# ══════ SALESMAN ══════
 with tabs[2]:
     st.subheader("Monitoring per Salesman")
     sm = (
@@ -397,12 +498,9 @@ with tabs[2]:
             "Qty (pcs)": st.column_config.NumberColumn(format="%d"),
         },
     )
-
-    st.markdown("#### Ranking Salesman — Omset Bruto")
     st.bar_chart(sm.head(15).set_index("Salesman")["Bruto"])
 
-    st.markdown("#### Detail Produk per Salesman")
-    sel_s = st.selectbox("Pilih salesman", sm["Salesman"].tolist(), key="sel_sm")
+    sel_s = st.selectbox("Detail produk salesman", sm["Salesman"].tolist(), key="sel_sm")
     if sel_s:
         sd = fdf[fdf["Salesman"] == sel_s]
         sd_prod = (
@@ -425,7 +523,7 @@ with tabs[2]:
             },
         )
 
-# ══════ TAB WILAYAH ══════
+# ══════ WILAYAH ══════
 with tabs[3]:
     st.subheader("Monitoring per Wilayah")
     kab = (
@@ -489,7 +587,7 @@ with tabs[3]:
         },
     )
 
-# ══════ TAB TREN ══════
+# ══════ TREN ══════
 with tabs[4]:
     st.subheader("Tren Penjualan")
     if "Tanggal Faktur" in fdf.columns and fdf["Tanggal Faktur"].notna().any():
@@ -503,10 +601,13 @@ with tabs[4]:
         )
         st.markdown("#### Tren Harian — Net Sales")
         st.line_chart(daily.set_index("Tanggal")["Net"])
-        st.markdown("#### Tren Harian — Quantity")
-        st.line_chart(daily.set_index("Tanggal")["Qty"])
-        st.markdown("#### Tren Harian — Omset Bruto")
-        st.line_chart(daily.set_index("Tanggal")["Bruto"])
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("#### Quantity")
+            st.line_chart(daily.set_index("Tanggal")["Qty"])
+        with c2:
+            st.markdown("#### Omset Bruto")
+            st.line_chart(daily.set_index("Tanggal")["Bruto"])
 
         st.dataframe(
             daily.rename(columns={
@@ -521,7 +622,7 @@ with tabs[4]:
             },
         )
 
-        if "WEEK" in fdf.columns:
+        if "WEEK" in fdf.columns and fdf["WEEK"].notna().any():
             st.markdown("#### Tren Mingguan")
             weekly = (
                 fdf.groupby("WEEK")
@@ -531,29 +632,19 @@ with tabs[4]:
             )
             weekly["Week"] = weekly["WEEK"].apply(lambda x: f"W{int(x)}")
             st.bar_chart(weekly.set_index("Week")["Net"])
-            st.dataframe(
-                weekly[["Week", "Qty", "Bruto", "Net", "Faktur"]].rename(columns={
-                    "Qty": "Qty (pcs)", "Bruto": "Omset Bruto",
-                    "Net": "Net Sales", "Faktur": "Jml Faktur"
-                }),
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "Omset Bruto": st.column_config.NumberColumn(format="Rp %d"),
-                    "Net Sales": st.column_config.NumberColumn(format="Rp %d"),
-                    "Qty (pcs)": st.column_config.NumberColumn(format="%d"),
-                },
-            )
     else:
-        st.warning("Kolom tanggal tidak tersedia di file ini.")
+        st.warning("Kolom tanggal tidak tersedia.")
 
-# ══════ TAB RETURN ══════
+# ══════ RETURN ══════
 with tabs[5]:
     st.subheader("Transaksi Return / Credit Note")
     rets = fdf[fdf["Total"] < 0].copy()
     if len(rets) == 0:
         st.success("Tidak ada transaksi return pada filter saat ini.")
     else:
-        st.warning(f"Total return: **{len(rets)}** transaksi | Nilai: **{fmt_rp(rets['Total'].sum())}**")
+        st.warning(
+            f"Total return: **{len(rets)}** transaksi | Nilai: **{fmt_rp(rets['Total'].sum())}**"
+        )
         ret_show = (
             rets.groupby(["Nama Outlet", "Nama Produk", "Salesman"])
             .agg(Qty=("QTYPCS", "sum"), Bruto=("Harga Bruto", "sum"), Net=("Total", "sum"))
@@ -571,10 +662,39 @@ with tabs[5]:
             },
         )
 
-# ══════ TAB EXPORT ══════
+# ══════ EXPORT ══════
 with tabs[6]:
-    st.subheader("Download Ringkasan")
-    st.markdown("Unduh data hasil filter dalam format Excel.")
+    st.subheader("Download & Cache")
+
+    st.markdown("### ⚡ Cache Cepat (rekomendasi)")
+    st.markdown(
+        "Download file **Parquet** ini sekali. Lain kali pilih **Load Cache** di sidebar "
+        "— jauh lebih cepat & file lebih kecil dibanding Excel mentah."
+    )
+    try:
+        parquet_bytes = df_to_parquet_bytes(df)
+        st.download_button(
+            "⬇️ Download Cache Parquet (untuk load cepat)",
+            data=parquet_bytes,
+            file_name=f"LBP_cache_{datetime.now().strftime('%Y%m%d')}.parquet",
+            mime="application/octet-stream",
+            use_container_width=True,
+        )
+        st.caption(f"Ukuran cache: {len(parquet_bytes)/1024:.0f} KB | {len(df):,} baris")
+    except Exception as e:
+        st.warning(f"Parquet tidak tersedia ({e}). Install pyarrow: pip install pyarrow")
+        csv_buf = BytesIO()
+        df.to_csv(csv_buf, index=False)
+        st.download_button(
+            "⬇️ Download Cache CSV",
+            data=csv_buf.getvalue(),
+            file_name=f"LBP_cache_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+    st.markdown("### 📊 Export Ringkasan Excel")
 
     def to_excel_bytes(frames: dict) -> bytes:
         buf = BytesIO()
@@ -601,17 +721,19 @@ with tabs[6]:
     )
 
     excel_data = to_excel_bytes({
-        "Produk": prod_exp,
-        "Outlet": out_exp,
-        "Salesman": sm_exp,
-        "Data Filtered": fdf,
+        "Produk": prod_exp, "Outlet": out_exp,
+        "Salesman": sm_exp, "Data Filtered": fdf,
     })
     st.download_button(
         "⬇️ Download Excel Ringkasan",
         data=excel_data,
         file_name=f"LBP_Monitor_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
     )
 
 st.markdown("---")
-st.caption("LBP Sales Monitor • Upload XLSX → Monitoring lengkap • Mobile-friendly")
+st.caption(
+    "LBP Sales Monitor • Data tersimpan di session browser • "
+    "Download Cache Parquet agar tidak perlu upload Excel berulang"
+)
