@@ -34,6 +34,31 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+
+def col_uniques(df, col):
+    """Safe unique values even if duplicate column names exist."""
+    if col not in df.columns:
+        return []
+    s = df[col]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    return sorted(s.dropna().astype(str).unique().tolist())
+
+
+
+def _dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """If rename created duplicate column names, keep first occurrence."""
+    if not df.columns.duplicated().any():
+        return df
+    return df.loc[:, ~df.columns.duplicated()].copy()
+
+
+def _ensure_series(df, col):
+    s = df[col]
+    if isinstance(s, pd.DataFrame):
+        return s.iloc[:, 0]
+    return s
+
 def fmt_rp(v):
     if pd.isna(v):
         return "-"
@@ -101,6 +126,7 @@ def load_lbp(file) -> pd.DataFrame:
             col_map[c] = "AMOUNT"
 
     df = df.rename(columns=col_map)
+    df = _dedupe_columns(df)
 
     for col in ["QTYPCS", "Harga Bruto", "Total", "DISC", "PROAMOUNT", "AMOUNT"]:
         if col in df.columns:
@@ -217,6 +243,7 @@ def load_csv_pipe(file) -> pd.DataFrame:
             col_map[c] = "Kelurahan"
 
     df = df.rename(columns=col_map)
+    df = _dedupe_columns(df)
 
     for col in ["QTYPCS", "Harga Bruto", "Total", "DISC", "PROAMOUNT", "AMOUNT"]:
         if col in df.columns:
@@ -338,16 +365,30 @@ def df_to_csv_gz_bytes(df: pd.DataFrame) -> bytes:
 
 
 def kpi_row(df):
+    def _sum(col):
+        if col not in df.columns:
+            return 0
+        s = _ensure_series(df, col)
+        return pd.to_numeric(s, errors="coerce").fillna(0).sum()
+
+    def _nunique(col):
+        if col not in df.columns:
+            return 0
+        s = _ensure_series(df, col)
+        return s.nunique()
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Net Sales", fmt_rp(df["Total"].sum()))
-    c2.metric("Omset Bruto", fmt_rp(df["Harga Bruto"].sum()))
-    c3.metric("Quantity", fmt_num(df["QTYPCS"].sum()) + " pcs")
-    c4.metric("Outlet", fmt_num(df["No Outlet"].nunique()))
+    c1.metric("Net Sales", fmt_rp(_sum("Total")))
+    c2.metric("Omset Bruto", fmt_rp(_sum("Harga Bruto")))
+    c3.metric("Quantity", fmt_num(_sum("QTYPCS")) + " pcs")
+    c4.metric("Outlet", fmt_num(_nunique("No Outlet")))
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Faktur", fmt_num(df["Faktur"].nunique()) if "Faktur" in df.columns else "-")
-    c6.metric("Produk SKU", fmt_num(df["Pcode"].nunique()))
-    c7.metric("Discount", fmt_rp(df["DISC"].sum()) if "DISC" in df.columns else "-")
-    ret = df[df["Total"] < 0]["Total"].sum()
+    c5.metric("Faktur", fmt_num(_nunique("Faktur")))
+    c6.metric("Produk SKU", fmt_num(_nunique("Pcode")))
+    c7.metric("Discount", fmt_rp(_sum("DISC")))
+    total_s = _ensure_series(df, "Total") if "Total" in df.columns else pd.Series([0])
+    total_s = pd.to_numeric(total_s, errors="coerce").fillna(0)
+    ret = total_s[total_s < 0].sum()
     c8.metric("Return", fmt_rp(ret))
 
 
@@ -492,27 +533,27 @@ if df is None:
 
 # ── Filters ──
 st.sidebar.markdown("### 🔎 Filter")
-all_kab = sorted(df["Kabupaten"].dropna().unique().tolist())
+all_kab = col_uniques(df, "Kabupaten")
 sel_kab = st.sidebar.multiselect("Kabupaten", all_kab, default=all_kab)
 
-all_sm = sorted(df["Salesman"].dropna().unique().tolist())
+all_sm = col_uniques(df, "Salesman")
 sel_sm = st.sidebar.multiselect("Salesman", all_sm, default=[])
 
-all_sb = sorted(df["SUBBRANDNAME"].dropna().unique().tolist())
+all_sb = col_uniques(df, "SUBBRANDNAME")
 sel_sb = st.sidebar.multiselect("Subbrand", all_sb, default=[])
 
-all_ch = sorted(df["Channel"].dropna().unique().tolist())
+all_ch = col_uniques(df, "Channel")
 sel_ch = st.sidebar.multiselect("Channel", all_ch, default=[])
 
 fdf = df.copy()
-if sel_kab:
-    fdf = fdf[fdf["Kabupaten"].isin(sel_kab)]
-if sel_sm:
-    fdf = fdf[fdf["Salesman"].isin(sel_sm)]
-if sel_sb:
-    fdf = fdf[fdf["SUBBRANDNAME"].isin(sel_sb)]
-if sel_ch:
-    fdf = fdf[fdf["Channel"].isin(sel_ch)]
+if sel_kab and "Kabupaten" in fdf.columns:
+    fdf = fdf[_ensure_series(fdf, "Kabupaten").isin(sel_kab)]
+if sel_sm and "Salesman" in fdf.columns:
+    fdf = fdf[_ensure_series(fdf, "Salesman").isin(sel_sm)]
+if sel_sb and "SUBBRANDNAME" in fdf.columns:
+    fdf = fdf[_ensure_series(fdf, "SUBBRANDNAME").isin(sel_sb)]
+if sel_ch and "Channel" in fdf.columns:
+    fdf = fdf[_ensure_series(fdf, "Channel").isin(sel_ch)]
 
 if "Tanggal Faktur" in fdf.columns and fdf["Tanggal Faktur"].notna().any():
     min_d = fdf["Tanggal Faktur"].min().date()
